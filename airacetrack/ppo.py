@@ -55,15 +55,16 @@ class RunningMeanStd:
 @dataclass
 class PPOConfig:
     lr: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 0.995           # Diskontierungsgrad (≈10 s Horizont)
     gae_lambda: float = 0.95
     clip: float = 0.2
     epochs: int = 4
     minibatches: int = 4
-    ent_coef: float = 0.02         # Entropie-Bonus (Exploration)
+    ent_coef: float = 0.02         # Entropie-Bonus am Anfang (Exploration)
+    ent_coef_end: float = 0.002    # … am Ende der Laufzeit
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
-    lr_decay_steps: int = 0      # 0 = konstante Lernrate
+    lr_decay_steps: int = 0        # 0 = konstante Lernrate
 
 
 class PPO:
@@ -82,11 +83,14 @@ class PPO:
         self.updates = 0
 
     # ------------------------------------------------------------------
-    def _lr(self) -> float:
+    def _decay_frac(self) -> float:
+        """0 → 1 über die geplante Laufzeit (Lernrate & Entropie-Zerfall)."""
         if self.cfg.lr_decay_steps <= 0:
-            return self.cfg.lr
-        frac = min(1.0, self.updates / max(self.cfg.lr_decay_steps, 1))
-        return self.cfg.lr * (1.0 - frac)
+            return 0.0
+        return min(1.0, self.updates / max(self.cfg.lr_decay_steps, 1))
+
+    def _lr(self) -> float:
+        return self.cfg.lr * (1.0 - self._decay_frac())
 
     def normalize(self, obs: np.ndarray) -> np.ndarray:
         return self.obs_rms.normalize(obs)
@@ -141,6 +145,7 @@ class PPO:
         """Ein PPO-Update über die gesammelte Rollout-Batch."""
         cfg = self.cfg
         self.model.train()
+        ent_coef = cfg.ent_coef + (cfg.ent_coef_end - cfg.ent_coef) * self._decay_frac()
         for g in self.optimizer.param_groups:
             g["lr"] = self._lr()
 
@@ -177,7 +182,7 @@ class PPO:
                 v_loss = nn.functional.mse_loss(value, ret[idx])
                 entropy_loss = -entropy.mean()
 
-                loss = pi_loss + cfg.vf_coef * v_loss + cfg.ent_coef * entropy_loss
+                loss = pi_loss + cfg.vf_coef * v_loss + ent_coef * entropy_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()

@@ -19,19 +19,20 @@ Algorithmus: PPO (Actor-Critic, tanh-gedämpfte Aktionen, GAE)
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+source .venv/bin/activate
+pip install -r requirements.txt
 
 # Strecke ansehen
-.venv/bin/python -m airacetrack.preview_track --out track.png
+python3 -m airacetrack.preview_track --out track.png
 
 # KI trainieren (Standard: 500k Schritte, dauert auf dem CPU ~5 Minuten)
-.venv/bin/python -m airacetrack.train --steps 500000
+python3 -m airacetrack.train --steps 500000
 
 # Ergebnis auswerten
-.venv/bin/python -m airacetrack.evaluate runs/<timestamp>/best.pt
-.venv/bin/python -m airacetrack.evaluate runs/<timestamp>/best.pt --gif lauf.gif
-.venv/bin/python -m airacetrack.evaluate runs/<timestamp>/best.pt --plot traj.png
-.venv/bin/python -m airacetrack.evaluate runs/<timestamp>/best.pt --live
+python3 -m airacetrack.evaluate runs/<timestamp>/best.pt
+python3 -m airacetrack.evaluate runs/<timestamp>/best.pt --gif lauf.gif
+python3 -m airacetrack.evaluate runs/<timestamp>/best.pt --plot traj.png
+python3 -m airacetrack.evaluate runs/<timestamp>/best.pt --live
 ```
 
 ## Wie es funktioniert

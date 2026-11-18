@@ -25,12 +25,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="KI auf der Rennstrecke trainieren (PPO)")
     p.add_argument("--steps", type=int, default=500_000,
                    help="Gesamtzahl Trainings-Schritte (Aktionen)")
-    p.add_argument("--num-envs", type=int, default=16, help="Parallele Umgebungen")
+    p.add_argument("--num-envs", type=int, default=32, help="Parallele Umgebungen")
     p.add_argument("--rollout", type=int, default=128,
                    help="Schritte pro Umgebung und Rollout")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=0.995)
     p.add_argument("--total-laps", type=int, default=0,
                    help="Episodenende nach N Umläufen (0 = nur Zeitlimit)")
     p.add_argument("--resume", type=str, default=None,
@@ -63,6 +63,12 @@ def main() -> None:
     )
     if args.resume:
         agent, payload = PPO.load(args.resume)
+        if agent.obs_dim != obs_dim or agent.act_dim != act_dim:
+            raise SystemExit(
+                f"Checkpoint wurde mit {agent.obs_dim} Beobachtungen/"
+                f"{agent.act_dim} Aktionen trainiert, die aktuelle Umgebung "
+                f"hat {obs_dim}/{act_dim} – Abbruch."
+            )
         print(f"Fortgesetzt von {args.resume} "
               f"(Update #{agent.updates}, {payload.get('train_steps', 0)} Schritte)")
     else:
@@ -75,18 +81,48 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "log.csv"
     if not log_path.exists():
-        with log_path.open("w", newline="") as f:
-            csv.writer(f).writerow(
-                ["global_step", "episodes", "mean_reward", "mean_progress",
-                 "crash_rate", "stranded_rate", "mean_speed", "mean_lap_time",
-                 "updates", "fps"]
-            )
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("w", newline="") as f:
+                csv.writer(f).writerow(
+                    ["global_step", "episodes", "mean_reward", "mean_progress",
+                     "crash_rate", "stranded_rate", "mean_speed", "mean_lap_time",
+                     "updates", "fps"]
+                )
+        except OSError:
+            pass  # safe_log meldet den Fehler später mit Warnung
 
     print(f"Strecke: {track.length:.0f} m | {len(track.checkpoint_idx)} Checkpoints | "
           f"Env-Config: dt={env_cfg.dt}s, max_steps={env_cfg.max_steps}")
     print(f"Netz: {OBS_DIM} Beobachtungen → {ACT_DIM} Aktionen | "
           f"{args.num_envs} Umgebungen × {args.rollout} Schritte/Rollout")
     print(f"Ausgabe: {run_dir}\n")
+
+    warn_state = {"log": False, "save": False}
+
+    def safe_log(row) -> None:
+        """CSV-Zeile anhängen – wiederholt angelegtes Verzeichnis, kein Abbruch."""
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", newline="") as f:
+                csv.writer(f).writerow(row)
+        except OSError as e:
+            if not warn_state["log"]:
+                warn_state["log"] = True
+                print(f"\nWARNUNG: Protokoll nicht schreibbar ({e}) – "
+                      f"Training läuft weiter ohne log.csv.")
+
+    def safe_save(extra: dict, name: str = "latest.pt") -> None:
+        """Checkpoint speichern – Ordner neu anlegen, Fehler nicht töten."""
+        path = run_dir / name
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            agent.save(str(path), extra)
+        except OSError as e:
+            if not warn_state["save"]:
+                warn_state["save"] = True
+                print(f"\nWARNUNG: Checkpoint {path} nicht speicherbar ({e}) – "
+                      f"Training läuft weiter ohne Checkpoints.")
 
     # Rollout-Buffers
     T, N = args.rollout, args.num_envs
@@ -201,28 +237,26 @@ def main() -> None:
                     f"{np.mean(sp):>7.1f} {mean_lt:>11.1f} {fps:>6.0f}"
                 )
                 print(line)
-                with log_path.open("a", newline="") as f:
-                    csv.writer(f).writerow(
-                        [global_step, episodes, round(np.mean(rw), 3),
-                         round(np.mean(pr), 2), round(float(np.mean(cr)), 3),
-                         round(float(np.mean(st)), 3),
-                         round(float(np.mean(sp)), 3),
-                         round(float(mean_lt), 3) if lt else "",
-                         agent.updates, round(fps, 1)]
-                    )
+                safe_log(
+                    [global_step, episodes, round(np.mean(rw), 3),
+                     round(np.mean(pr), 2), round(float(np.mean(cr)), 3),
+                     round(float(np.mean(st)), 3),
+                     round(float(np.mean(sp)), 3),
+                     round(float(mean_lt), 3) if lt else "",
+                     agent.updates, round(fps, 1)]
+                )
 
                 score = np.mean(rw[-min(len(rw), 20):])
                 if score > best_score:
                     best_score = score
-                    agent.save(str(run_dir / "best.pt"),
-                               {"train_steps": global_step, "score": score})
+                    safe_save({"train_steps": global_step, "score": score},
+                              name="best.pt")
 
         if global_step % args.save_every < N:
-            agent.save(str(run_dir / "latest.pt"), {"train_steps": global_step})
+            safe_save({"train_steps": global_step})
 
     # ---------------- Abschluss ----------------
-    agent.save(str(run_dir / "latest.pt"),
-               {"train_steps": global_step, "score": best_score})
+    safe_save({"train_steps": global_step, "score": best_score})
     elapsed = time.time() - t_start
     print(f"\nFertig: {global_step} Schritte, {episodes} Episoden in "
           f"{elapsed:.0f}s ({global_step/elapsed:.0f} FPS)")

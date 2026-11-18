@@ -52,8 +52,14 @@ class EnvConfig:
     w_lap: float = 30.0
     w_grass: float = -0.4
     w_crash: float = -60.0         # Unfall = teuer (Anreiz sauber zu fahren)
-    w_stranded: float = -25.0      # Stillstand = Episode gescheitert
+    w_stranded: float = -70.0      # Stillstand ist die teuerste Option:
+    #                                Fahren > Unfall > Aufgeben
     w_smooth: float = -0.05
+    # Dichte Warn-Belohnungen (Signal NOCH VOR dem Unfall)
+    w_wall: float = -0.20          # Mauernähe: nah an die Wand fahren
+    wall_dist: float = 4.0         # ab welcher Sensor-Distanz [m]
+    w_lat: float = -0.06           # quadratisch am Kantenversatz
+    w_align: float = -0.08         # Winkelfehler zur Streckenrichtung [1/rad]
 
     @property
     def ray_angles(self) -> np.ndarray:
@@ -115,6 +121,7 @@ class RaceEnv:
         self._time = 0.0
         self._lap_start_time = 0.0
         self._stranded_count = 0
+        self._last_lap_time = None
         self._prev_action = np.zeros(2, dtype=np.float32)
         return self._observe()
 
@@ -139,6 +146,10 @@ class RaceEnv:
         else:
             self._stranded_count = 0
 
+        # Sensoren einmal je Schritt (für Belohnung und Beobachtung)
+        angles = self._ray_angles + self.car.heading
+        ray_d = t.raycast(self.car.position, angles, cfg.ray_max)
+
         # Fortschritt
         idx_new, lat_new, s_new = t.nearest(self.car.position)
         delta_s = t.wrap_delta_s(self._prev_s, s_new)
@@ -155,12 +166,24 @@ class RaceEnv:
             self.next_cp = 1
             lap_time = self._time - self._lap_start_time
             self._lap_start_time = self._time
+            self._last_lap_time = lap_time
+
+        # Ausrichtung zur Strecke (für Belohnung)
+        track_heading = np.arctan2(t.tangent[idx_new, 1], t.tangent[idx_new, 0])
+        h_err = self.car.heading - track_heading
+        h_err = float((h_err + np.pi) % (2.0 * np.pi) - np.pi)
 
         # Belohnung
         reward = cfg.w_progress * delta_s
         reward += cfg.w_speed * self.car.speed
         reward += cfg.w_time
         reward += cfg.w_smooth * abs(action[0] - self._prev_action[0])
+        # dichte Warn-Signale vor dem Unfall
+        d_min = float(ray_d.min())
+        if d_min < cfg.wall_dist:
+            reward += cfg.w_wall * (cfg.wall_dist - d_min) / cfg.wall_dist
+        reward += cfg.w_lat * (lat_new / t.half_width) ** 2
+        reward += cfg.w_align * abs(h_err)
         if on_grass:
             reward += cfg.w_grass
         if self.lap > 0 and lap_time is not None:
@@ -172,7 +195,7 @@ class RaceEnv:
             "stranded": False,
             "on_grass": on_grass,
             "lap": self.lap,
-            "lap_time": lap_time,
+            "lap_time": lap_time if lap_time is not None else self._last_lap_time,
             "progress": self.total_progress,
             "speed": self.car.speed,
             "time": self._time,
@@ -191,19 +214,20 @@ class RaceEnv:
             info["truncated"] = True
 
         self._prev_action = action.astype(np.float32)
-        obs = self._observe(idx=idx_new, lat=lat_new, s=s_new)
+        obs = self._observe(idx=idx_new, lat=lat_new, s=s_new, dists=ray_d)
         return obs, float(reward), done, info
 
     # ------------------------------------------------------------------
     def _observe(self, idx: int | None = None, lat: float | None = None,
-                 s: float | None = None) -> np.ndarray:
+                 s: float | None = None, dists: np.ndarray | None = None) -> np.ndarray:
         t = self.track
         if idx is None:
             idx, lat, s = t.nearest(self.car.position)
 
-        # Sensoren
-        angles = self._ray_angles + self.car.heading
-        dists = t.raycast(self.car.position, angles, self.cfg.ray_max)
+        # Sensoren (falls nicht schon im Schritt berechnet)
+        if dists is None:
+            angles = self._ray_angles + self.car.heading
+            dists = t.raycast(self.car.position, angles, self.cfg.ray_max)
         dists = dists / self.cfg.ray_max
 
         # Ausrichtung zur Strecke
