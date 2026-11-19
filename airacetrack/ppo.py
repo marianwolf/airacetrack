@@ -65,6 +65,7 @@ class PPOConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     lr_decay_steps: int = 0        # 0 = konstante Lernrate
+    decay_offset: int = 0          # Update, ab dem der Zerfall läuft (Resume)
 
 
 class PPO:
@@ -84,10 +85,17 @@ class PPO:
 
     # ------------------------------------------------------------------
     def _decay_frac(self) -> float:
-        """0 → 1 über die geplante Laufzeit (Lernrate & Entropie-Zerfall)."""
+        """0 → 1 über die geplante Laufzeit (Lernrate & Entropie-Zerfall).
+
+        `decay_offset` erlaubt es, bei einem Resume den Zerfall erneut über
+        die neue Laufzeit laufen zu lassen, statt bei ~1,0 zu starten (was die
+        Lernrate sofort auf 0 drücken würde).
+        """
         if self.cfg.lr_decay_steps <= 0:
             return 0.0
-        return min(1.0, self.updates / max(self.cfg.lr_decay_steps, 1))
+        start = self.cfg.decay_offset
+        span = max(self.cfg.lr_decay_steps - start, 1)
+        return min(1.0, max(0.0, (self.updates - start) / span))
 
     def _lr(self) -> float:
         return self.cfg.lr * (1.0 - self._decay_frac())

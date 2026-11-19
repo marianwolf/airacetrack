@@ -27,6 +27,16 @@ python3 -m airacetrack.preview_track --out track.png
 
 # KI trainieren (Standard: 500k Schritte, dauert auf dem CPU ~5 Minuten)
 python3 -m airacetrack.train --steps 500000
+```
+
+Ohne weitere Angaben lädt `train` **das neueste `best.pt` unter `runs/`** und
+fährt dort weiter – nichts wird neu gelernt, `--steps` sind dann die *zusätzlichen*
+Schritte dieses Laufs. Wer bewusst neu anfangen will: `--fresh`.
+
+```bash
+python3 -m airacetrack.train --steps 500000     # fortsetzen (auto)
+python3 -m airacetrack.train --fresh --steps 500000   # bei null anfangen
+python3 -m airacetrack.train --resume runs/20261118-163645/best.pt --steps 100000
 
 # Ergebnis auswerten
 python3 -m airacetrack.evaluate runs/<timestamp>/best.pt
@@ -81,13 +91,19 @@ Gym-kompatible API: `reset() → obs`, `step(action) → obs, reward, done, info
 
 ```
 +0,10 · Fortschritt in Metern      (Hauptanreiz)
-+0,005 · Geschwindigkeit           (Tempo zahlt sich sofort aus)
-−0,01                            (Zeitkosten gegen Stillstand)
-+30                            (bonus pro Umlauf)
++0,004 · Geschwindigkeit           (Tempo zahlt sich sofort aus)
+−0,018                            (Zeitkosten gegen Stillstand → senkt die Ø Zeit)
++30 + 2,5 · (60 s − Rundenzeit)   (Bonus pro Umlauf, schnellere Runde = mehr;
+                                    Untergrenze 0, damit Fahren immer lohnt)
 −0,40 · jede Sekunde auf Gras       (Motorleistung weg)
 −60                            (Unfall → Episodenende)
-−25                            (Strandung: >3 s Stillstand = gescheitert)
+−70                            (Strandung: >3 s Stillstand = gescheitert)
 ```
+
+Die Gewichte sind bewusst Richtung **Rundenzeit und Ø-Zeit** verschoben:
+Rundenzeit-Bonus und Zeitkosten sind stärker, die reine Momentan-Speed-Prämie
+etwas reduziert – Anreiz ist die tatsächliche Umlaufzeit, nicht das Tempo
+auf der Geraden.
 
 Episoden starten **zufällig auf der ganzen Strecke** (20–40 m/s), damit die KI
 Kurven aus allen Situationen heraus lernen muss und nicht nur das Ausrollen vom
@@ -104,18 +120,22 @@ Start.
   PPO-Verhältnisse exakt passen
 * 16 parallele Umgebungen, 128 Schritte je Rollout (2048 Samples je Update)
 * Linearer Lernraten-Zerfall über die Laufzeit, Entropie-Bonus 0,02
-* Checkpoints: `runs/<timestamp>/latest.pt` (fortsetzbar) und `best.pt`
+* Checkpoints: `runs/<timestamp>/latest.pt` (fortsetzbar) und `best.pt` –
+  `train` startet automatisch mit dem neuesten `best.pt` weiter
+  (Schritt-Zähler, Score-Grenze und Lernraten-Plan laufen sauber weiter)
 
 ## CLI-Optionen
 
 ```bash
 # Trainieren
 python -m airacetrack.train \
-    --steps 2000000 \          # Trainings-Schritte
+    --steps 2000000 \          # Schritte dieses Laufs (zusätzlich zu den
+                               # bereits trainierten – automatisch fortgesetzt)
     --num-envs 32 \            # parallele Umgebungen
     --rollout 256 \            # Schritte je Rollout
     --gamma 0.99 \             # Discount-Faktor
-    --resume runs/.../latest.pt
+    --fresh \                  # nicht fortsetzen, sondern neu anfangen
+    --resume runs/.../best.pt  # bestimmten Checkpoint laden
 
 # Auswerten
 python -m airacetrack.evaluate pfad/best.pt \
@@ -158,4 +178,7 @@ airacetrack/
 * **Schwieriger machen**: `EnvConfig` in `train.py` (z. B. `w_grass` senken,
   `runoff` verkleinern, `width` auf 10 m).
 * **Strecke härter**: mehr engere Kontrollpunkte in `tracks.py`.
-* **Modell weitertrainieren**: `--resume runs/…/latest.pt`.
+* **Modell weitertrainieren**: einfach nochmal `python -m airacetrack.train
+  --steps 500000` starten – das neueste `best.pt` wird automatisch geladen
+  (`--resume pfad/…/best.pt` wählt einen anderen, `--fresh` beginnt neu).
+  Am Ende des Laufs stehen wieder `best.pt` und `latest.pt` im selben Ordner.

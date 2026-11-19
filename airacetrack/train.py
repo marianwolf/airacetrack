@@ -2,6 +2,10 @@
 
     python -m airacetrack.train --steps 500000
 
+Läuft automatisch mit dem neuesten `best.pt` unter `runs/` weiter (falls
+vorhanden), damit nichts neu gelernt werden muss – `--fresh` startet bewusst
+bei null, `--resume pfad/…/best.pt` wählt einen bestimmten Checkpoint.
+
 Speichert Checkpoints und eine CSV-Protokolldatei unter `runs/<zeitstempel>/`.
 """
 
@@ -24,23 +28,54 @@ from .tracks import CONTROL_POINTS, TRACK_CONFIG
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="KI auf der Rennstrecke trainieren (PPO)")
     p.add_argument("--steps", type=int, default=500_000,
-                   help="Gesamtzahl Trainings-Schritte (Aktionen)")
+                   help="Trainings-Schritte dieses Laufs (zusätzlich zu den "
+                        "bereits trainierten)")
     p.add_argument("--num-envs", type=int, default=32, help="Parallele Umgebungen")
     p.add_argument("--rollout", type=int, default=128,
                    help="Schritte pro Umgebung und Rollout")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--gamma", type=float, default=0.995)
+    p.add_argument("--lr", type=float, default=None,
+                   help="Lernrate (Standard: 3e-4)")
+    p.add_argument("--gamma", type=float, default=None,
+                   help="Discount-Faktor (Standard: 0.995)")
     p.add_argument("--total-laps", type=int, default=0,
                    help="Episodenende nach N Umläufen (0 = nur Zeitlimit)")
     p.add_argument("--resume", type=str, default=None,
-                   help="Checkpoint fortsetzen (.pt)")
+                   help="Checkpoint fortsetzen (.pt) – ohne Angabe wird das "
+                        "neueste best.pt unter --out geladen, falls vorhanden")
+    p.add_argument("--fresh", action="store_true",
+                   help="Nicht fortsetzen, sondern bei null anfangen")
     p.add_argument("--out", type=str, default="runs", help="Ausgabeordner")
     p.add_argument("--log-every", type=int, default=10_000,
                    help="Alle N Schritte Protokoll ausgeben")
     p.add_argument("--save-every", type=int, default=50_000,
                    help="Alle N Schritten Checkpoint speichern")
     return p.parse_args()
+
+
+def find_latest_checkpoint(out_dir: str | Path) -> Path | None:
+    """Neuestes `best.pt` unter `<out>/**` – Fallback: neuestes `latest.pt`."""
+    root = Path(out_dir)
+    if not root.exists():
+        return None
+
+    def mtime(p: Path) -> float:
+        return p.stat().st_mtime
+
+    best = sorted(root.glob("**/best.pt"), key=mtime, reverse=True)
+    if best:
+        return best[0]
+    latest = sorted(root.glob("**/latest.pt"), key=mtime, reverse=True)
+    return latest[0] if latest else None
+
+
+def last_log_row(csv_path: Path) -> list[str] | None:
+    """Letzte Datenzeile einer CSV – oder None, wenn nicht lesbar/leer."""
+    try:
+        with csv_path.open(newline="") as f:
+            return next(csv.reader(deque(f, maxlen=1)), None)
+    except OSError:
+        return None
 
 
 def main() -> None:
@@ -54,32 +89,70 @@ def main() -> None:
     obs_dim, act_dim = envs[0].observation_dim, envs[0].action_dim
     assert (obs_dim, act_dim) == (OBS_DIM, ACT_DIM)
 
-    # Agent
-    ppo_cfg = PPOConfig(
-        lr=args.lr,
-        gamma=args.gamma,
-        # Lineare Lernrate-Zerrung bis zum Ende der Laufzeit (0 = konstant)
-        lr_decay_steps=max(args.steps // (args.rollout * args.num_envs), 1),
-    )
+    # Agent – vorhandenen Checkpoint fortsetzen, sonst frisch anlegen
+    if args.fresh and args.resume:
+        raise SystemExit("--fresh und --resume schließen sich aus.")
+    resume_path: Path | None = None
     if args.resume:
-        agent, payload = PPO.load(args.resume)
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise SystemExit(f"Checkpoint nicht gefunden: {resume_path}")
+    elif not args.fresh:
+        resume_path = find_latest_checkpoint(args.out)
+
+    # Zerfall von Lernrate/Entropie über die Schritte dieses Laufs
+    updates_per_run = max(args.steps // (args.rollout * args.num_envs), 1)
+    payload: dict = {}
+    start_step = 0
+    episodes = 0
+    best_score = -np.inf
+
+    if resume_path is not None:
+        agent, payload = PPO.load(str(resume_path))
         if agent.obs_dim != obs_dim or agent.act_dim != act_dim:
             raise SystemExit(
                 f"Checkpoint wurde mit {agent.obs_dim} Beobachtungen/"
                 f"{agent.act_dim} Aktionen trainiert, die aktuelle Umgebung "
                 f"hat {obs_dim}/{act_dim} – Abbruch."
             )
-        print(f"Fortgesetzt von {args.resume} "
-              f"(Update #{agent.updates}, {payload.get('train_steps', 0)} Schritte)")
+        # Zerfall erneut über diese Laufzeit laufen lassen – sonst stünde die
+        # Lernrate am Ende des alten Plans bereits auf ~0 und es passierte
+        # beim Fortsetzen nichts mehr.
+        agent.cfg.decay_offset = agent.updates
+        agent.cfg.lr_decay_steps = agent.updates + updates_per_run
+        if args.lr is not None:
+            agent.cfg.lr = args.lr
+        if args.gamma is not None:
+            agent.cfg.gamma = args.gamma
+        start_step = int(payload.get("train_steps", 0))
+        episodes = int(payload.get("episodes", 0))
+        best_score = float(payload.get("score", -np.inf))
+        print(f"Fortgesetzt von {resume_path}")
+        print(f"  {start_step} Schritte, Update #{agent.updates}, "
+              f"Score {best_score:.1f} | Lernrate {agent.cfg.lr:g} zerfällt "
+              f"über {updates_per_run} neue Schritte")
     else:
-        agent = PPO(obs_dim, act_dim, ppo_cfg)
+        agent = PPO(obs_dim, act_dim, PPOConfig(
+            lr=3e-4 if args.lr is None else args.lr,
+            gamma=0.995 if args.gamma is None else args.gamma,
+            lr_decay_steps=updates_per_run,
+        ))
 
-    # Ausgabeordner
-    run_dir = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
-    if args.resume and Path(args.resume).parent.exists():
-        run_dir = Path(args.resume).parent
+    # Ausgabeordner – bei einem Resume im Ordner des Checkpoints weiterschreiben
+    if resume_path is not None:
+        run_dir = resume_path.parent
+    else:
+        run_dir = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "log.csv"
+    # Alte Checkpoint kennen den Episoden-Zähler nicht → aus dem Protokoll
+    if resume_path is not None and "episodes" not in payload:
+        row = last_log_row(log_path)
+        if row and len(row) > 1:
+            try:
+                episodes = int(float(row[1]))
+            except ValueError:
+                pass
     if not log_path.exists():
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +169,7 @@ def main() -> None:
           f"Env-Config: dt={env_cfg.dt}s, max_steps={env_cfg.max_steps}")
     print(f"Netz: {OBS_DIM} Beobachtungen → {ACT_DIM} Aktionen | "
           f"{args.num_envs} Umgebungen × {args.rollout} Schritte/Rollout")
+    print(f"Ziel: {start_step} + {args.steps} = {start_step + args.steps} Schritte")
     print(f"Ausgabe: {run_dir}\n")
 
     warn_state = {"log": False, "save": False}
@@ -124,6 +198,10 @@ def main() -> None:
                 print(f"\nWARNUNG: Checkpoint {path} nicht speicherbar ({e}) – "
                       f"Training läuft weiter ohne Checkpoints.")
 
+    def save_extra() -> dict:
+        return {"train_steps": global_step, "episodes": episodes,
+                "score": best_score}
+
     # Rollout-Buffers
     T, N = args.rollout, args.num_envs
     buf_obs = np.zeros((T, N, obs_dim), dtype=np.float32)
@@ -141,17 +219,17 @@ def main() -> None:
     ep_steps = np.zeros(N)
     recent = deque(maxlen=50)          # letzte Episoden
     lap_times: list[float] = []
-    global_step = 0
-    episodes = 0
-    best_score = -np.inf
+    global_step = start_step
+    target_step = start_step + args.steps
     t_start = time.time()
     t_log = t_start
-    steps_log = 0
+    steps_log = start_step
+    last_save = start_step
 
     print(f"{'Schritt':>10} {'Episoden':>9} {'Rewards':>8} {'Fortschritt':>12} "
           f"{'Crash%':>7} {'Strand%':>8} {'Tempo':>7} {'Rundenzeit':>11} {'FPS':>6}")
 
-    while global_step < args.steps:
+    while global_step < target_step:
         # ---------------- Rollout sammeln ----------------
         for t in range(T):
             actions, logps, values, norm_obs = agent.act(obs)
@@ -197,7 +275,7 @@ def main() -> None:
             if pending:
                 vals = agent.value(np.stack([o for _, o in pending]))
                 for (i, _), v in zip(pending, vals):
-                    buf_nextval[t, i] = args.gamma * float(v)
+                    buf_nextval[t, i] = agent.cfg.gamma * float(v)
 
             obs = next_obs
             global_step += N
@@ -217,7 +295,7 @@ def main() -> None:
         stats = agent.update(batch)
 
         # ---------------- Protokoll ----------------
-        if global_step - steps_log >= args.log_every or global_step >= args.steps:
+        if global_step - steps_log >= args.log_every or global_step >= target_step:
             now = time.time()
             fps = (global_step - steps_log) / max(now - t_log, 1e-9)
             steps_log, t_log = global_step, now
@@ -246,25 +324,32 @@ def main() -> None:
                      agent.updates, round(fps, 1)]
                 )
 
+                # Volles 20-Episoden-Fenster nötig: ein Glückstreffer mit
+                # zwei kurzen Episoden darf best.pt nicht überschreiben.
                 score = np.mean(rw[-min(len(rw), 20):])
-                if score > best_score:
+                if len(rw) >= 20 and score > best_score:
                     best_score = score
-                    safe_save({"train_steps": global_step, "score": score},
-                              name="best.pt")
+                    safe_save(save_extra(), name="best.pt")
 
-        if global_step % args.save_every < N:
-            safe_save({"train_steps": global_step})
+        if global_step - last_save >= args.save_every:
+            last_save = global_step
+            safe_save(save_extra())
 
     # ---------------- Abschluss ----------------
-    safe_save({"train_steps": global_step, "score": best_score})
+    safe_save(save_extra())
+    if not (run_dir / "best.pt").exists():   # kurze Läufe: best.pt anlegen
+        safe_save(save_extra(), name="best.pt")
     elapsed = time.time() - t_start
-    print(f"\nFertig: {global_step} Schritte, {episodes} Episoden in "
-          f"{elapsed:.0f}s ({global_step/elapsed:.0f} FPS)")
+    new_steps = global_step - start_step
+    print(f"\nFertig: {new_steps} neue Schritte (gesamt {global_step}), "
+          f"{episodes} Episoden in {elapsed:.0f}s "
+          f"({new_steps/elapsed:.0f} FPS)")
     if lap_times:
         print(f"Beste Rundenzeit: {min(lap_times):.1f}s | "
           f"Ø letzte: {np.mean(lap_times[-10:]):.1f}s")
     print(f"Checkpoints: {run_dir/'best.pt'}, {run_dir/'latest.pt'}")
-    print(f"Auswerten:   .venv/bin/python -m airacetrack.evaluate "
+    print(f"Weitertrainieren: .venv/bin/python -m airacetrack.train --steps 500000")
+    print(f"Auswerten:        .venv/bin/python -m airacetrack.evaluate "
           f"{run_dir/'best.pt'} --gif lauf.gif")
 
 
