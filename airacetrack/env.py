@@ -12,9 +12,8 @@ Beobachtung (18 Werte):
 Belohnung:
   + Fortschritt in Metern (Hauptanreiz, dichtes Signal)
   + kleine Geschwindigkeitsprämie (Tempo)
-  - Zeitkosten pro Schritt (Gegenanreiz gegen Stille-Trippeln → senkt die Ø Zeit)
-  + Umlauf-Bonus, der von der Rundenzeit abhängt (Referenz 60 s,
-    2,5 Punkte pro Sekunde darunter – schnellere Runden zahlen mehr)
+  - Zeitkosten pro Schritt (Gegenanreiz gegen Stille-Trippeln)
+  + großer Bonus pro abgeschlossenem Umlauf
   - Strafe fürs Fahren auf Gras (Minderung + Motorleistung weg)
   - große Strafe bei Unfall (Absturz in die Mauer) → Episodenende
 """
@@ -46,16 +45,11 @@ class EnvConfig:
     # Strandung: wer dauerhaft stillsteht, beendet die Episode
     stranded_speed: float = 1.0    # Schwelle [m/s]
     stranded_steps: int = 60       # wie viele Schritte unter der Schwelle (3 s)
-    # Belohnungsgewichte – bewusst Richtung Rundenzeit/Ø-Zeit gewichtet:
-    # schnelles Fahren zahlt sich weniger über die Momentangeschwindigkeit
-    # aus als darüber, wie schnell die Runden tatsächlich fallen.
+    # Belohnungsgewichte
     w_progress: float = 0.10
-    w_speed: float = 0.004         # Tempobelohnung (leicht zurückgenommen)
-    w_time: float = -0.018         # Zeitkosten pro Schritt → senkt die Ø Zeit
-    w_lap: float = 30.0            # Grundbonus pro Umlauf
-    lap_ref_time: float = 30.0     # Referenz-Rundenzeit [s] (Soll-Zeit)
-    w_lap_time: float = 2.5        # Bonus pro Sekunde UNTER der Referenz:
-    #                                52 s → +50, 45 s → +67, ab 75 s → 0
+    w_speed: float = 0.005         # Tempobelohnung: zahlt sich sofort aus
+    w_time: float = -0.005
+    w_lap: float = 30.0
     w_grass: float = -0.4
     w_crash: float = -60.0         # Unfall = teuer (Anreiz sauber zu fahren)
     w_stranded: float = -70.0      # Stillstand ist die teuerste Option:
@@ -193,10 +187,7 @@ class RaceEnv:
         if on_grass:
             reward += cfg.w_grass
         if self.lap > 0 and lap_time is not None:
-            # Je schneller die Runde, desto größer der Bonus – aber ein
-            # Umlauf lohnt sich auch bei sehr langsamen Zeiten weiterhin.
-            lap_bonus = cfg.w_lap + cfg.w_lap_time * (cfg.lap_ref_time - lap_time)
-            reward += max(lap_bonus, 0.0)
+            reward += cfg.w_lap
 
         done = False
         info = {
